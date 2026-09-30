@@ -342,6 +342,206 @@ class UM960Configurator:
         if changed and self.save_config and not self.should_stop():
             if self.send_command("SAVECONFIG", timeout=5.0):
                 self.log("UM960: configuration saved to NVM.")
+
+
+# -------------------------------------------------------------------------
+# NTRIP CLIENT (RTK corrections from a caster, e.g. igs-ip.net / EUREF / national networks)
+# -------------------------------------------------------------------------
+class NtripError(Exception):
+    """Connection or protocol error; worth retrying."""
+
+
+class NtripFatalError(NtripError):
+    """Error that retrying will not fix (bad credentials, unknown mountpoint)."""
+
+
+class NtripClient:
+    """
+    Minimal NTRIP client. Sends the request the way the tested feed_rtk scripts did
+    (HTTP/1.1 with an 'Ntrip-Version: Ntrip/1.0' header), accepts both 'ICY 200 OK' (v1)
+    and 'HTTP/1.x 200 OK' (v2) replies, and decodes chunked transfer encoding.
+    """
+    def __init__(self, host, port, mountpoint, user="", password="", timeout=10.0):
+        self.host = host
+        self.port = int(port)
+        self.mountpoint = mountpoint.lstrip('/')
+        self.user = user
+        self.password = password
+        self.timeout = timeout
+        self.sock = None
+        self._chunked = False
+        self._leftover = b""   # data received together with the reply headers
+        self._chunk_buf = b""  # incomplete chunk framing waiting for more data
+        self._chunk_left = 0   # bytes remaining in the current chunk
+
+    def connect(self):
+        import base64
+        import socket
+
+        self.close()
+        try:
+            self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+        except OSError as e:  # includes TimeoutError
+            raise NtripError(f"cannot connect to {self.host}:{self.port}: {e}") from e
+
+        request = (f"GET /{self.mountpoint} HTTP/1.1\\r\\n"
+                   f"Host: {self.host}\\r\\n"
+                   f"Ntrip-Version: Ntrip/1.0\\r\\n"
+                   f"User-Agent: NTRIP UM960-GNSS-Dashboard/1.0\\r\\n")
+        if self.user:
+            token = base64.b64encode(f"{self.user}:{self.password}".encode('utf-8')).decode('ascii')
+            request += f"Authorization: Basic {token}\\r\\n"
+        request += "Accept: */*\\r\\nConnection: close\\r\\n\\r\\n"
+        self.sock.sendall(request.encode('ascii'))
+
+        # Read the status line (and headers for HTTP replies)
+        data = b""
+        while b"\\r\\n" not in data:
+            data += self._recv_raw()
+        status, rest = data.split(b"\\r\\n", 1)
+        status_text = status.decode('latin-1').strip()
+
+        if status_text.startswith("ICY 200"):
+            self._leftover = rest
+            return status_text
+        if status_text.startswith("SOURCETABLE"):
+            raise NtripFatalError(f"mountpoint '{self.mountpoint}' not found (caster returned its source table)")
+        if not status_text.startswith("HTTP/"):
+            raise NtripError(f"unexpected reply: {status_text[:80]}")
+
+        while b"\\r\\n\\r\\n" not in b"\\r\\n" + rest:
+            rest += self._recv_raw()
+        headers, body = (b"\\r\\n" + rest).split(b"\\r\\n\\r\\n", 1)
+        code = status_text.split()[1] if len(status_text.split()) > 1 else ""
+        if code == "401":
+            raise NtripFatalError("authorization failed (check user name and password)")
+        if code in ("404", "400") or b"gnss/sourcetable" in headers.lower():
+            raise NtripFatalError(f"mountpoint '{self.mountpoint}' not available ({status_text})")
+        if code != "200":
+            raise NtripError(f"caster replied: {status_text}")
+        self._chunked = b"transfer-encoding: chunked" in headers.lower()
+        self._leftover = body
+        return status_text
+
+    def _recv_raw(self):
+        try:
+            data = self.sock.recv(4096)
+        except TimeoutError:
+            raise  # no data within the socket timeout; the caller decides what to do
+        except OSError as e:
+            raise NtripError(f"connection error: {e}") from e
+        if not data:
+            raise NtripError("connection closed by caster")
+        return data
+
+    def read(self):
+        """
+        Returns the next block of correction data (may be b"" if only chunk framing arrived).
+        Raises TimeoutError if nothing arrives within the socket timeout.
+        """
+        if self._leftover:
+            data, self._leftover = self._leftover, b""
+        else:
+            data = self._recv_raw()
+        if not self._chunked:
+            return data
+        data, self._chunk_buf = self._chunk_buf + data, b""
+        return self._dechunk(data)
+
+    def _dechunk(self, data):
+        out = b""
+        while data:
+            if self._chunk_left:
+                take = data[:self._chunk_left]
+                out += take
+                self._chunk_left -= len(take)
+                data = data[len(take):]
+                continue
+            if data.startswith(b"\\r\\n"):
+                data = data[2:]
+                continue
+            if b"\\r\\n" not in data:
+                self._chunk_buf = data  # incomplete chunk size line, completed by the next read
+                break
+            size_line, data = data.split(b"\\r\\n", 1)
+            try:
+                self._chunk_left = int(size_line.split(b";")[0], 16)
+            except ValueError:
+                raise NtripError("malformed chunked data from caster")
+            if self._chunk_left == 0:
+                raise NtripError("caster ended the stream")
+        return out
+
+    def send_gga(self, gga_line):
+        """Reports the receiver position to the caster (required by VRS / network mountpoints)."""
+        try:
+            self.sock.sendall((gga_line.strip() + "\\r\\n").encode('ascii'))
+        except OSError as e:
+            raise NtripError(f"connection error: {e}") from e
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+        self._leftover = b""
+        self._chunk_buf = b""
+        self._chunked = False
+        self._chunk_left = 0
+
+
+def _crc24q_table():
+    table = []
+    for i in range(256):
+        crc = i << 16
+        for _ in range(8):
+            crc <<= 1
+            if crc & 0x1000000:
+                crc ^= 0x1864CFB
+        table.append(crc & 0xFFFFFF)
+    return table
+
+
+_CRC24Q = _crc24q_table()
+
+
+def crc24q(data):
+    crc = 0
+    for byte in data:
+        crc = ((crc << 8) & 0xFFFFFF) ^ _CRC24Q[(crc >> 16) ^ byte]
+    return crc
+
+
+class Rtcm3Scanner:
+    """Finds RTCM3 frames (0xD3, 10-bit length, payload, CRC-24Q) in a byte stream and reports message types."""
+    def __init__(self):
+        self._buffer = bytearray()
+
+    def feed(self, data):
+        """Returns the message numbers of all complete, CRC-valid frames found."""
+        self._buffer += data
+        types = []
+        while True:
+            start = self._buffer.find(0xD3)
+            if start < 0:
+                self._buffer.clear()
+                break
+            del self._buffer[:start]
+            if len(self._buffer) < 6:
+                break
+            length = ((self._buffer[1] & 0x03) << 8) | self._buffer[2]
+            frame_len = 3 + length + 3
+            if len(self._buffer) < frame_len:
+                break
+            frame = bytes(self._buffer[:frame_len])
+            if crc24q(frame[:-3]) == int.from_bytes(frame[-3:], 'big') and length >= 2:
+                types.append((frame[3] << 4) | (frame[4] >> 4))
+                del self._buffer[:frame_len]
+            else:
+                del self._buffer[:1]  # false sync byte, keep searching
+        return types
 # --- End of um960_core.py ---
 
 

@@ -6,6 +6,7 @@ Desktop version of the web app's "GIS Dashboard" page:
 
   * WGS84 / BGS2005 (UTM 34N + CCS2005 Lambert) / GGRS87 Greek Grid coordinate cards
   * Receiver connection with automatic reconnect, ROVER mode check and NMEA output setup
+  * NTRIP client: RTK corrections from a caster are written to the receiver over the same serial port
   * Constellation counts, DOP, skyplot and carrier signal strength (C/N0)
   * Live trajectory on an OpenStreetMap / satellite basemap (Leaflet in a QWebEngineView,
     loaded once and updated through JavaScript, so it does not reload or flicker)
@@ -13,6 +14,7 @@ Desktop version of the web app's "GIS Dashboard" page:
 
 Prerequisites:
   pip install PySide6 pyserial pyproj
+  pip install keyring      # optional: remember the NTRIP password in the system keyring
 
 Usage:
   python3 um960_dashboard_qt.py
@@ -26,7 +28,9 @@ import html
 import json
 import math
 import time
+import queue
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 
 try:
@@ -40,7 +44,7 @@ try:
     from PySide6.QtCore import Qt, QSettings, QThread, QTimer, QUrl, QRectF, QPointF, Signal
     from PySide6.QtGui import QColor, QFont, QFontDatabase, QPainter, QPalette, QPen
     from PySide6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QMainWindow,
+        QApplication, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
         QPlainTextEdit, QProgressBar, QPushButton, QScrollArea, QSizePolicy, QToolButton, QVBoxLayout,
         QWidget,
     )
@@ -50,7 +54,12 @@ except ImportError:
     print("Error: 'PySide6' (with QtWebEngine) is required. Install with 'pip install PySide6'.")
     sys.exit(1)
 
-from um960_core import convert_coordinates, UM960Configurator
+try:
+    import keyring
+except ImportError:
+    keyring = None
+
+from um960_core import convert_coordinates, UM960Configurator, NtripClient, NtripError, NtripFatalError, Rtcm3Scanner
 
 
 # -------------------------------------------------------------------------
@@ -104,8 +113,9 @@ QLabel#gridTitle {{ color: {SLATE_400}; font-weight: 700; font-size: 12px; lette
 QLabel#muted {{ color: {SLATE_400}; font-size: 11px; }}
 QLabel#faint {{ color: {SLATE_500}; font-size: 10px; }}
 QLabel#pill {{ background: {SLATE_900}; border: 1px solid {SLATE_800}; border-radius: 8px; padding: 5px 10px; }}
-QComboBox {{ background: {SLATE_900}; border: 1px solid {SLATE_800}; border-radius: 4px; padding: 4px 6px; color: white; }}
-QComboBox:focus {{ border-color: {EMERALD}; }}
+QComboBox, QLineEdit {{ background: {SLATE_900}; border: 1px solid {SLATE_800}; border-radius: 4px; padding: 4px 6px; color: white; }}
+QComboBox:focus, QLineEdit:focus {{ border-color: {EMERALD}; }}
+QComboBox:disabled, QLineEdit:disabled {{ color: {SLATE_500}; }}
 QComboBox QAbstractItemView {{ background: {SLATE_900}; selection-background-color: #065f46; }}
 QPushButton, QToolButton {{ background: {SLATE_950}; border: 1px solid {SLATE_800}; border-radius: 4px;
     padding: 5px 10px; color: {SLATE_400}; font-weight: 700; font-size: 10px; }}
@@ -208,6 +218,9 @@ class NMEAParser:
         self.bgs_east = self.bgs_north = float('nan')
         self.bgs_lam_east = self.bgs_lam_north = float('nan')
         self.gr_east = self.gr_north = float('nan')
+        self.diff_age = float('nan')  # age of the corrections used by the receiver (GGA), seconds
+        self.diff_station = ""        # reference station ID of those corrections
+        self.last_gga = ""            # last GGA sentence with a position (forwarded to the NTRIP caster)
         self.last_sentence = ""
         self.checksum_errors = 0
 
@@ -268,7 +281,10 @@ class NMEAParser:
         self.last_sentence = sentence
         try:
             if kind == 'GGA':
-                return self._parse_gga(parts)
+                has_position = self._parse_gga(parts)
+                if has_position:
+                    self.last_gga = line
+                return has_position
             if kind == 'RMC':
                 self._parse_rmc(parts)
             elif kind == 'VTG':
@@ -297,6 +313,8 @@ class NMEAParser:
         self.longitude = self._parse_lat_lon(parts[4], parts[5])
         self.altitude = self._float(parts[9])
         self.hdop = self._float(parts[8], self.hdop)
+        self.diff_age = self._float(parts[13]) if len(parts) > 13 else float('nan')
+        self.diff_station = parts[14] if len(parts) > 14 else ""
         self._update_grids()
         return True
 
@@ -394,6 +412,8 @@ class SerialWorker(QThread):
     """
     Reads lines from the receiver in a background thread. If the port fails (e.g. the USB adapter
     drops out) it is reopened every RECONNECT_DELAY_S until stop() is called.
+    Data queued with send_raw() (RTCM corrections) is written from the same thread between reads,
+    so it never interleaves with configuration commands.
     """
     line_received = Signal(str)
     status = Signal(str)
@@ -408,15 +428,35 @@ class SerialWorker(QThread):
         self.configure = configure
         self.save_config = save_config
         self._stop = False
+        self._tx = queue.Queue(maxsize=256)
+        self._ready = False  # port open and configured, accepting data to write
 
     def stop(self):
         self._stop = True
         self.wait()
 
+    def send_raw(self, data):
+        """Queues bytes for the receiver (thread-safe). Returns False if they were dropped."""
+        if not self._ready:
+            return False
+        try:
+            self._tx.put_nowait(data)
+            return True
+        except queue.Full:
+            return False
+
+    def _flush_tx(self, conn):
+        while True:
+            try:
+                conn.write(self._tx.get_nowait())
+            except queue.Empty:
+                return
+
     def run(self):
         while not self._stop:
             try:
-                with serial.Serial(self.port, self.baud, timeout=0.5) as conn:
+                # Short timeout: queued corrections are written between reads
+                with serial.Serial(self.port, self.baud, timeout=0.2) as conn:
                     self.status.emit(f"Opened {self.port} at {self.baud} baud.")
                     self.connection_changed.emit(True)
                     if self.configure:
@@ -425,13 +465,16 @@ class SerialWorker(QThread):
                             save_config=self.save_config, nmea_messages=NMEA_MESSAGES,
                             should_stop=lambda: self._stop,
                         ).configure()
+                    self._ready = True
                     while not self._stop:
+                        self._flush_tx(conn)
                         raw = conn.readline()
                         if raw:
                             line = raw.decode('ascii', errors='replace').strip()
                             if line:
                                 self.line_received.emit(line)
             except (serial.SerialException, OSError) as e:
+                self._ready = False
                 self.connection_changed.emit(False)
                 if self._stop:
                     break
@@ -440,6 +483,101 @@ class SerialWorker(QThread):
                 while not self._stop and time.monotonic() < deadline:
                     self.msleep(100)
         self.connection_changed.emit(False)
+
+
+class NtripWorker(QThread):
+    """
+    Receives RTK corrections from an NTRIP caster and hands them to `on_data` (the serial worker's
+    send_raw). The receiver's latest GGA (set through the `gga` attribute) is sent to the caster every
+    GGA_INTERVAL_S, as network/VRS mountpoints require. Reconnects after errors, except for bad
+    credentials or an unknown mountpoint.
+    """
+    status = Signal(str)
+    state_changed = Signal(str)  # 'connecting', 'streaming', 'reconnecting', 'error', 'stopped'
+    stats = Signal(dict)
+
+    GGA_INTERVAL_S = 10.0
+    STALL_TIMEOUT_S = 30.0
+    RECONNECT_DELAY_S = 5.0
+
+    def __init__(self, host, port, mountpoint, user, password, send_gga, on_data, parent=None):
+        super().__init__(parent)
+        self.client = NtripClient(host, port, mountpoint, user, password, timeout=5.0)
+        self.send_gga = send_gga
+        self.on_data = on_data
+        self.gga = ""
+        self._stop = False
+        self._bytes = 0
+        self._forwarded = 0
+        self._last_data = None
+        self._messages = Counter()
+        self._last_stats = 0.0
+
+    def stop(self):
+        self._stop = True
+        self.wait()
+
+    def _emit_stats(self, force=False):
+        now = time.monotonic()
+        if force or now - self._last_stats >= 1.0:
+            self._last_stats = now
+            self.stats.emit({
+                'bytes': self._bytes, 'forwarded': self._forwarded, 'messages': dict(self._messages),
+                'age': None if self._last_data is None else now - self._last_data,
+            })
+
+    def _sleep(self, seconds):
+        deadline = time.monotonic() + seconds
+        while not self._stop and time.monotonic() < deadline:
+            self.msleep(100)
+
+    def run(self):
+        scanner = Rtcm3Scanner()
+        mount = self.client.mountpoint
+        while not self._stop:
+            try:
+                self.state_changed.emit('connecting')
+                self.status.emit(f"NTRIP: connecting to {self.client.host}:{self.client.port}/{mount}...")
+                reply = self.client.connect()
+                self.client.sock.settimeout(1.0)  # lets the loop check stop / GGA timer every second
+                self.state_changed.emit('streaming')
+                self.status.emit(f"NTRIP: streaming {mount} ({reply})")
+                last_gga = 0.0
+                last_rx = time.monotonic()
+                while not self._stop:
+                    now = time.monotonic()
+                    if self.send_gga and self.gga and now - last_gga >= self.GGA_INTERVAL_S:
+                        self.client.send_gga(self.gga)
+                        last_gga = now
+                    try:
+                        data = self.client.read()
+                    except TimeoutError:
+                        if now - last_rx > self.STALL_TIMEOUT_S:
+                            raise NtripError(f"no data for {self.STALL_TIMEOUT_S:g} s")
+                        self._emit_stats()
+                        continue
+                    if data:
+                        last_rx = self._last_data = time.monotonic()
+                        self._bytes += len(data)
+                        if self.on_data(data):
+                            self._forwarded += len(data)
+                        self._messages.update(scanner.feed(data))
+                    self._emit_stats()
+            except NtripFatalError as e:
+                self.status.emit(f"NTRIP: {e}")
+                self.state_changed.emit('error')
+                break
+            except (NtripError, OSError) as e:
+                if self._stop:
+                    break
+                self.state_changed.emit('reconnecting')
+                self.status.emit(f"NTRIP: {e}. Reconnecting in {self.RECONNECT_DELAY_S:g} s...")
+                self._sleep(self.RECONNECT_DELAY_S)
+            finally:
+                self.client.close()
+        self._emit_stats(force=True)
+        if self._stop:
+            self.state_changed.emit('stopped')
 
 
 # -------------------------------------------------------------------------
@@ -920,6 +1058,9 @@ class DashboardWindow(QMainWindow):
         self.parser = NMEAParser()
         self.settings = QSettings("um960", "gis-dashboard")
         self.worker = None
+        self.ntrip = None
+        self.ntrip_state = 'stopped'
+        self.ntrip_stats = {}
         self.is_connected = False
         self._dirty = False
         self._feed_pending = []
@@ -958,6 +1099,8 @@ class DashboardWindow(QMainWindow):
 
         if args.connect:
             QTimer.singleShot(0, self._toggle_connection)
+        if args.ntrip:
+            QTimer.singleShot(0, self._toggle_ntrip)
 
     # --- construction -----------------------------------------------------
     def _build_header(self):
@@ -991,8 +1134,9 @@ class DashboardWindow(QMainWindow):
         self.hdr_connection = QLabel()
         self.hdr_sats = QLabel()
         self.hdr_heading = QLabel()
+        self.hdr_ntrip = QLabel()
         self.hdr_fix = QLabel()
-        for w in (self.hdr_parser, self.hdr_connection, self.hdr_sats, self.hdr_heading):
+        for w in (self.hdr_parser, self.hdr_connection, self.hdr_ntrip, self.hdr_sats, self.hdr_heading):
             w.setObjectName("pill")
             layout.addWidget(w)
         layout.addWidget(self.hdr_fix)
@@ -1083,7 +1227,9 @@ class DashboardWindow(QMainWindow):
         layout.addWidget(inset)
         column.addWidget(card)
 
-        # 2. Constellations, DOP, motion
+        column.addWidget(self._build_ntrip_card(args))
+
+        # 3. Constellations, DOP, motion
         card, layout = make_card("📶  BDS / GNSS Constellations")
         inset = QFrame()
         inset.setObjectName("inset")
@@ -1121,6 +1267,72 @@ class DashboardWindow(QMainWindow):
         column.addWidget(card)
         column.addStretch()
         return column
+
+    def _build_ntrip_card(self, args):
+        card, layout = make_card("📡  NTRIP Corrections (RTK)")
+        inset = QFrame()
+        inset.setObjectName("inset")
+        grid = QGridLayout(inset)
+        grid.setContentsMargins(12, 12, 12, 12)
+        grid.setVerticalSpacing(6)
+
+        def label(text):
+            w = QLabel(text)
+            w.setObjectName("faint")
+            return w
+
+        self.ntrip_host = QLineEdit(self.settings.value("ntrip/host", ""))
+        self.ntrip_host.setPlaceholderText("caster, e.g. igs-ip.net")
+        self.ntrip_port = QLineEdit(str(self.settings.value("ntrip/port", "2101")))
+        self.ntrip_port.setFixedWidth(70)
+        self.ntrip_mount = QLineEdit(self.settings.value("ntrip/mountpoint", ""))
+        self.ntrip_mount.setPlaceholderText("mountpoint")
+        self.ntrip_user = QLineEdit(self.settings.value("ntrip/user", ""))
+        self.ntrip_user.setPlaceholderText("user name")
+        self.ntrip_password = QLineEdit()
+        self.ntrip_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ntrip_password.setPlaceholderText("password")
+        self.ntrip_password.setText(self._load_ntrip_password())
+
+        self.ntrip_gga_check = QCheckBox("Send receiver position (GGA) to caster")
+        self.ntrip_gga_check.setChecked(self.settings.value("ntrip/send_gga", True, type=bool))
+        self.ntrip_remember_check = QCheckBox("Remember password (system keyring)")
+        if keyring is None:
+            self.ntrip_remember_check.setEnabled(False)
+            self.ntrip_remember_check.setToolTip("Install the 'keyring' package to enable, or set the "
+                                                 "UM960_NTRIP_PASSWORD environment variable")
+        else:
+            self.ntrip_remember_check.setChecked(self.settings.value("ntrip/remember_password", False, type=bool))
+        for check in (self.ntrip_gga_check, self.ntrip_remember_check):
+            check.setStyleSheet(f"color: {SLATE_400}; font-size: 11px;")
+
+        self.ntrip_button = QPushButton("Start Corrections")
+        self.ntrip_button.setObjectName("connect")
+        self.ntrip_button.clicked.connect(self._toggle_ntrip)
+        self.ntrip_status = QLabel("Corrections off.")
+        self.ntrip_status.setWordWrap(True)
+        self.ntrip_status.setObjectName("muted")
+        self.ntrip_info = QLabel()
+        self.ntrip_info.setWordWrap(True)
+        self.ntrip_info.setStyleSheet(f"font-family: '{mono_family()}'; font-size: 11px; color: {SLATE_200};")
+
+        grid.addWidget(label("CASTER / PORT"), 0, 0, 1, 2)
+        grid.addWidget(self.ntrip_host, 1, 0)
+        grid.addWidget(self.ntrip_port, 1, 1)
+        grid.addWidget(label("MOUNTPOINT"), 2, 0, 1, 2)
+        grid.addWidget(self.ntrip_mount, 3, 0, 1, 2)
+        grid.addWidget(label("USER / PASSWORD"), 4, 0, 1, 2)
+        credentials = QHBoxLayout()
+        credentials.addWidget(self.ntrip_user)
+        credentials.addWidget(self.ntrip_password)
+        grid.addLayout(credentials, 5, 0, 1, 2)
+        grid.addWidget(self.ntrip_gga_check, 6, 0, 1, 2)
+        grid.addWidget(self.ntrip_remember_check, 7, 0, 1, 2)
+        grid.addWidget(self.ntrip_button, 8, 0, 1, 2)
+        grid.addWidget(self.ntrip_status, 9, 0, 1, 2)
+        grid.addWidget(self.ntrip_info, 10, 0, 1, 2)
+        layout.addWidget(inset)
+        return card
 
     def _build_map_card(self):
         card, layout = make_card()
@@ -1268,6 +1480,109 @@ class DashboardWindow(QMainWindow):
         widget.style().unpolish(widget)
         widget.style().polish(widget)
 
+    # --- NTRIP --------------------------------------------------------------
+    def _ntrip_inputs(self):
+        return (self.ntrip_host, self.ntrip_port, self.ntrip_mount, self.ntrip_user, self.ntrip_password,
+                self.ntrip_gga_check, self.ntrip_remember_check)
+
+    def _load_ntrip_password(self):
+        """Keyring (if enabled and available), otherwise the UM960_NTRIP_PASSWORD environment variable."""
+        if keyring is not None and self.settings.value("ntrip/remember_password", False, type=bool):
+            try:
+                password = keyring.get_password("um960-gis-dashboard", self.settings.value("ntrip/user", ""))
+                if password:
+                    return password
+            except Exception as e:
+                print(f"Keyring unavailable: {e}", file=sys.stderr)
+        return os.environ.get("UM960_NTRIP_PASSWORD", "")
+
+    def _save_ntrip_settings(self):
+        user = self.ntrip_user.text().strip()
+        self.settings.setValue("ntrip/host", self.ntrip_host.text().strip())
+        self.settings.setValue("ntrip/port", self.ntrip_port.text().strip())
+        self.settings.setValue("ntrip/mountpoint", self.ntrip_mount.text().strip())
+        self.settings.setValue("ntrip/user", user)
+        self.settings.setValue("ntrip/send_gga", self.ntrip_gga_check.isChecked())
+        self.settings.setValue("ntrip/remember_password", self.ntrip_remember_check.isChecked())
+        if keyring is None:
+            return
+        try:
+            if self.ntrip_remember_check.isChecked():
+                keyring.set_password("um960-gis-dashboard", user, self.ntrip_password.text())
+            else:
+                keyring.delete_password("um960-gis-dashboard", user)
+        except Exception:
+            pass  # nothing stored, or no keyring backend
+
+    def _toggle_ntrip(self):
+        if self.ntrip:
+            self.ntrip.stop()
+            self.ntrip = None
+            self._set_ntrip_state('stopped')
+            self._log_ntrip("NTRIP: stopped by user.")
+            return
+
+        host, mount = self.ntrip_host.text().strip(), self.ntrip_mount.text().strip()
+        try:
+            port = int(self.ntrip_port.text().strip())
+        except ValueError:
+            port = 0
+        if not host or not mount or not 0 < port < 65536:
+            self._log_ntrip("NTRIP: enter caster, port and mountpoint first.")
+            return
+        self._save_ntrip_settings()
+        self.ntrip_stats = {}
+        self.ntrip = NtripWorker(host, port, mount, self.ntrip_user.text().strip(), self.ntrip_password.text(),
+                                 self.ntrip_gga_check.isChecked(), self._forward_corrections, parent=self)
+        self.ntrip.gga = self.parser.last_gga
+        self.ntrip.status.connect(self._log_ntrip)
+        self.ntrip.state_changed.connect(self._on_ntrip_state)
+        self.ntrip.stats.connect(self._on_ntrip_stats)
+        self.ntrip.start()
+        self.ntrip_button.setText("Stop Corrections")
+        self.ntrip_button.setProperty("connected", True)
+        self._repolish(self.ntrip_button)
+        for w in self._ntrip_inputs():
+            w.setEnabled(False)
+
+    def _forward_corrections(self, data):
+        """Called from the NTRIP thread: queue corrections for the serial thread."""
+        worker = self.worker
+        return worker.send_raw(data) if worker else False
+
+    def _is_current_ntrip(self):
+        # Queued signals from a worker the user already stopped must not touch the current state
+        return self.sender() is self.ntrip
+
+    def _on_ntrip_state(self, state):
+        if not self._is_current_ntrip():
+            return
+        if state == 'error':
+            self.ntrip = None  # the worker ends itself on fatal errors
+        self._set_ntrip_state(state)
+
+    def _set_ntrip_state(self, state):
+        self.ntrip_state = state
+        if state in ('error', 'stopped'):
+            self.ntrip_button.setText("Start Corrections")
+            self.ntrip_button.setProperty("connected", False)
+            self._repolish(self.ntrip_button)
+            for w in self._ntrip_inputs():
+                w.setEnabled(True)
+            if keyring is None:
+                self.ntrip_remember_check.setEnabled(False)
+        self._dirty = True
+
+    def _on_ntrip_stats(self, stats):
+        if not self._is_current_ntrip():
+            return
+        self.ntrip_stats = stats
+        self._dirty = True
+
+    def _log_ntrip(self, message):
+        self.ntrip_status.setText(message)
+        self._feed_pending.append(f"<span style='color:#a78bfa'>» {html.escape(message)}</span>")
+
     def _log_status(self, message):
         self.conn_status.setText(message)
         self._feed_pending.append(f"<span style='color:#fbbf24'>» {html.escape(message)}</span>")
@@ -1284,6 +1599,8 @@ class DashboardWindow(QMainWindow):
             self._dirty = True
         if result and self.parser.has_position:
             self._push_map_position()
+            if self.ntrip:
+                self.ntrip.gga = self.parser.last_gga
 
     def _direction(self):
         """True heading if available, otherwise course over ground while moving."""
@@ -1331,6 +1648,11 @@ class DashboardWindow(QMainWindow):
             self.hdr_connection.setText(f"<span style='color:#f59e0b'>●</span> <b style='font-family:{mono}'>RECONNECTING</b>")
         else:
             self.hdr_connection.setText(f"<span style='color:{SLATE_500}'>●</span> <b style='font-family:{mono}'>OFFLINE</b>")
+        ntrip_colors = {'streaming': EMERALD, 'connecting': '#f59e0b', 'reconnecting': '#f59e0b', 'error': '#ef4444'}
+        ntrip_text = {'streaming': 'ON', 'connecting': 'CONNECTING', 'reconnecting': 'RECONNECTING', 'error': 'ERROR'}
+        self.hdr_ntrip.setText(f"<span style='color:{ntrip_colors.get(self.ntrip_state, SLATE_500)}'>●</span> "
+                               f"<span style='color:{SLATE_400}'>NTRIP:</span> "
+                               f"<b style='font-family:{mono}'>{ntrip_text.get(self.ntrip_state, 'OFF')}</b>")
         self.hdr_sats.setText(f"<span style='color:{SLATE_400}'>Satellites:</span> "
                               f"<b style='font-family:{mono}'>{p.num_satellites}</b>")
         direction, label = self._direction()
@@ -1375,11 +1697,38 @@ class DashboardWindow(QMainWindow):
             self.attitude_label.setText(f"<span style='color:{SLATE_400}'>Antenna Sensors:</span>  Pitch "
                                         f"<b>{p.pitch_deg:.2f}°</b>  |  Roll <b>{fmt(p.roll_deg, '.2f', '°')}</b>")
 
+        self._refresh_ntrip_info()
+
         satellites = p.satellites()
         self.skyplot.set_satellites(satellites)
         self.signal_bars.set_satellites(satellites)
 
+    def _refresh_ntrip_info(self):
+        p, st = self.parser, self.ntrip_stats
+        muted = lambda text: f"<span style='color:{SLATE_400}'>{text}</span>"
+        lines = []
+        if st:
+            kb = st['bytes'] / 1024
+            dropped = st['bytes'] - st['forwarded']
+            lines.append(f"{muted('Received:')} {kb:.1f} kB" +
+                         (f"  <span style='color:#f87171'>({dropped / 1024:.1f} kB not sent - receiver"
+                          f" not connected)</span>" if dropped else ""))
+            if st['age'] is not None and self.ntrip_state in ('streaming', 'reconnecting'):
+                age_color = EMERALD if st['age'] < 5 else ('#f59e0b' if st['age'] < 30 else '#ef4444')
+                lines.append(f"{muted('Last data:')} <span style='color:{age_color}'>{st['age']:.1f} s ago</span>")
+            if st['messages']:
+                lines.append(f"{muted('RTCM:')} " + " ".join(f"{t}×{n}" for t, n in sorted(st['messages'].items())))
+        if not math.isnan(p.diff_age):
+            station = f", station {p.diff_station}" if p.diff_station else ""
+            lines.append(f"{muted('Receiver:')} using corrections, age {p.diff_age:.1f} s{station}")
+        elif self.ntrip_state == 'streaming' and st.get('forwarded'):
+            lines.append(f"{muted('Receiver:')} not using corrections yet")
+        self.ntrip_info.setText("<br>".join(lines))
+        self.ntrip_info.setVisible(bool(lines))
+
     def closeEvent(self, event):
+        if self.ntrip:
+            self.ntrip.stop()
         if self.worker:
             self.worker.stop()
         super().closeEvent(event)
@@ -1392,6 +1741,7 @@ def main():
     parser.add_argument('--connect', action='store_true', help="Connect immediately on start")
     parser.add_argument('--no-configure', action='store_true', help="Do not check/configure the receiver on connect")
     parser.add_argument('--save-config', action='store_true', help="Persist configuration changes with SAVECONFIG")
+    parser.add_argument('--ntrip', action='store_true', help="Start NTRIP corrections on start (saved caster settings)")
     args = parser.parse_args()
 
     # Silence harmless Qt/QPA Wayland warnings (e.g., QWindow::requestActivate() messages)

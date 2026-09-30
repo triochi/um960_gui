@@ -21,6 +21,7 @@ The repository contains three front ends that share the same decoding and coordi
 - Trajectory on an OpenStreetMap or satellite basemap, coloured by fix quality
 - Raw NMEA feed with checksum validation
 - Automatic receiver setup on connect: switches the UM960 to ROVER mode if needed and enables the NMEA messages the dashboard uses
+- Built-in NTRIP client (desktop dashboard): RTK corrections from a caster are sent to the receiver over the same serial port
 
 ## Hardware
 
@@ -29,7 +30,8 @@ The repository contains three front ends that share the same decoding and coordi
 
 On power-up the module prints a single line naming the port you are connected to (e.g. `$devicename,COM1*67`).
 A factory-configured module outputs nothing else until messages are enabled, which the desktop dashboard and the tracker do for you.
-RTK corrections (RTCM) are detected automatically on any COM port, so they can be fed into the same port or a second one.
+RTK corrections (RTCM) are detected automatically on any COM port. The desktop dashboard sends them through the same
+port it reads NMEA from, so a single USB-UART adapter is enough.
 
 On Linux, add your user to the `dialout` group to access serial ports without root:
 
@@ -67,6 +69,7 @@ since they survive the adapter being re-plugged. The last port used is remembere
 | `--connect` | Connect immediately on start |
 | `--no-configure` | Do not check or change the receiver configuration |
 | `--save-config` | Save configuration changes to the receiver's flash (`SAVECONFIG`) |
+| `--ntrip` | Start NTRIP corrections on start, using the saved caster settings |
 
 Notes:
 
@@ -75,6 +78,26 @@ Notes:
 - If the serial port drops out (e.g. a flaky USB adapter), it is reopened every 2 seconds.
 - The basemap needs an internet connection. Map tiles are cached on disk between runs.
   All other panels work offline.
+
+### RTK corrections (NTRIP)
+
+The **NTRIP Corrections** panel connects to an NTRIP caster and forwards the RTCM stream to the receiver.
+Enter the caster, port (usually 2101), mountpoint, user name and password, then click **Start Corrections**.
+
+- The receiver's position (GGA) is sent to the caster every 10 seconds. Network / VRS mountpoints need it,
+  single-station mountpoints ignore it.
+- The panel shows the data received, the time since the last correction, the RTCM message types, and whether the
+  receiver is actually using the corrections (age of differential from GGA). The fix badge changes to
+  **RTK Float** and then **RTK Fixed** once the solution converges.
+- An unknown mountpoint or wrong credentials stop the client with a message. Network errors are retried every 5 seconds.
+- Mountpoint names must match the caster's source table exactly. For example, Sofia on
+  [igs-ip.net](http://www.igs-ip.net/home) is `SOFI00BGR0`. Free registration for the IGS and EUREF casters is at
+  [register.rtcm-ntrip.org](https://register.rtcm-ntrip.org/).
+- The password is not saved in the settings file. Install `keyring` (`pip install keyring`) and tick
+  **Remember password** to keep it in the system keyring, or set the `UM960_NTRIP_PASSWORD` environment variable.
+
+RTK needs a reference station reasonably close to the receiver: a baseline of up to about 20–30 km for a
+reliable fixed solution.
 
 ## Matplotlib tracker
 
