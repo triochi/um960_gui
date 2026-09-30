@@ -89,7 +89,11 @@ Enter the caster, port (usually 2101), mountpoint, user name and password, then 
 - The panel shows the data received, the time since the last correction, the RTCM message types, and whether the
   receiver is actually using the corrections (age of differential from GGA). The fix badge changes to
   **RTK Float** and then **RTK Fixed** once the solution converges.
-- An unknown mountpoint or wrong credentials stop the client with a message. Network errors are retried every 5 seconds.
+- The **NTRIP log** in the panel keeps the last 50 events with timestamps: connection attempts, refusals with the
+  caster's own explanation (e.g. `401 Unauthorized: Invalid user name or password`), dropped connections, and when
+  the receiver starts using the corrections or its fix changes to RTK Float / Fixed.
+- An unknown mountpoint, wrong credentials or a refused account stop the client. Network errors and temporary
+  refusals (e.g. `503`) are retried every 5 seconds.
 - Mountpoint names must match the caster's source table exactly. For example, Sofia on
   [igs-ip.net](http://www.igs-ip.net/home) is `SOFI00BGR0`. Free registration for the IGS and EUREF casters is at
   [register.rtcm-ntrip.org](https://register.rtcm-ntrip.org/).

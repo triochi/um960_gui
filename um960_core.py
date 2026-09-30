@@ -353,10 +353,16 @@ class NtripClient:
         request += "Accept: */*\r\nConnection: close\r\n\r\n"
         self.sock.sendall(request.encode('ascii'))
 
-        # Read the status line (and headers for HTTP replies)
+        # Read the status line (and headers for HTTP replies). A caster that closes the connection
+        # right after a short refusal still gets its text reported.
         data = b""
-        while b"\r\n" not in data:
-            data += self._recv_raw()
+        try:
+            while b"\r\n" not in data:
+                data += self._recv_raw()
+        except NtripError:
+            if not data:
+                raise
+            data += b"\r\n"
         status, rest = data.split(b"\r\n", 1)
         status_text = status.decode('latin-1').strip()
 
@@ -366,21 +372,55 @@ class NtripClient:
         if status_text.startswith("SOURCETABLE"):
             raise NtripFatalError(f"mountpoint '{self.mountpoint}' not found (caster returned its source table)")
         if not status_text.startswith("HTTP/"):
-            raise NtripError(f"unexpected reply: {status_text[:80]}")
+            message = f"caster replied: {status_text[:120]}{self._error_detail(rest)}"
+            if status_text.upper().startswith("ERROR"):
+                # v1 casters refuse with e.g. "ERROR - Bad Password"; retrying would not help
+                raise NtripFatalError(message)
+            raise NtripError(message)
 
-        while b"\r\n\r\n" not in b"\r\n" + rest:
-            rest += self._recv_raw()
+        try:
+            while b"\r\n\r\n" not in b"\r\n" + rest:
+                rest += self._recv_raw()
+        except NtripError:
+            rest += b"\r\n\r\n"  # closed after a partial header
         headers, body = (b"\r\n" + rest).split(b"\r\n\r\n", 1)
         code = status_text.split()[1] if len(status_text.split()) > 1 else ""
+        if code == "200" and b"gnss/sourcetable" not in headers.lower():
+            self._chunked = b"transfer-encoding: chunked" in headers.lower()
+            self._leftover = body
+            return status_text
+
+        detail = self._error_detail(body)
         if code == "401":
-            raise NtripFatalError("authorization failed (check user name and password)")
+            raise NtripFatalError(f"authorization failed, check user name and password ({status_text}){detail}")
         if code in ("404", "400") or b"gnss/sourcetable" in headers.lower():
-            raise NtripFatalError(f"mountpoint '{self.mountpoint}' not available ({status_text})")
-        if code != "200":
-            raise NtripError(f"caster replied: {status_text}")
-        self._chunked = b"transfer-encoding: chunked" in headers.lower()
-        self._leftover = body
-        return status_text
+            raise NtripFatalError(f"mountpoint '{self.mountpoint}' not available ({status_text}){detail}")
+        if code == "403":
+            raise NtripFatalError(f"access refused ({status_text}){detail}")
+        raise NtripError(f"caster replied: {status_text}{detail}")
+
+    def _error_detail(self, body, max_chars=200):
+        """
+        Reads the rest of a refusal reply (briefly) and returns its text as ': <text>', or ''.
+        Casters often explain the refusal there, e.g. 'account expired' or 'too many connections'.
+        """
+        import re
+        try:
+            self.sock.settimeout(1.0)
+            while len(body) < 4096:
+                data = self.sock.recv(4096)
+                if not data:
+                    break
+                body += data
+        except OSError:  # includes TimeoutError
+            pass
+        text = body.decode('utf-8', errors='replace')
+        text = re.sub(r"(?is)<(script|style|head)\b.*?</\1>", " ", text)  # drop non-visible HTML parts
+        text = re.sub(r"<[^>]+>", " ", text)                              # remaining tags
+        text = " ".join(text.split())
+        if not text:
+            return ""
+        return f": {text[:max_chars]}{'...' if len(text) > max_chars else ''}"
 
     def _recv_raw(self):
         try:

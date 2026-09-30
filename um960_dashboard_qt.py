@@ -492,7 +492,7 @@ class NtripWorker(QThread):
     GGA_INTERVAL_S, as network/VRS mountpoints require. Reconnects after errors, except for bad
     credentials or an unknown mountpoint.
     """
-    status = Signal(str)
+    status = Signal(str, str)    # level ('info', 'ok', 'warn', 'error'), message
     state_changed = Signal(str)  # 'connecting', 'streaming', 'reconnecting', 'error', 'stopped'
     stats = Signal(dict)
 
@@ -537,17 +537,20 @@ class NtripWorker(QThread):
         while not self._stop:
             try:
                 self.state_changed.emit('connecting')
-                self.status.emit(f"NTRIP: connecting to {self.client.host}:{self.client.port}/{mount}...")
+                self.status.emit('info', f"connecting to {self.client.host}:{self.client.port}/{mount}...")
                 reply = self.client.connect()
                 self.client.sock.settimeout(1.0)  # lets the loop check stop / GGA timer every second
                 self.state_changed.emit('streaming')
-                self.status.emit(f"NTRIP: streaming {mount} ({reply})")
+                self.status.emit('ok', f"connected to {mount} ({reply})")
+                first_data = True
                 last_gga = 0.0
                 last_rx = time.monotonic()
                 while not self._stop:
                     now = time.monotonic()
                     if self.send_gga and self.gga and now - last_gga >= self.GGA_INTERVAL_S:
                         self.client.send_gga(self.gga)
+                        if last_gga == 0.0:
+                            self.status.emit('info', "sending receiver position (GGA) to caster")
                         last_gga = now
                     try:
                         data = self.client.read()
@@ -557,6 +560,9 @@ class NtripWorker(QThread):
                         self._emit_stats()
                         continue
                     if data:
+                        if first_data:
+                            first_data = False
+                            self.status.emit('ok', "receiving corrections")
                         last_rx = self._last_data = time.monotonic()
                         self._bytes += len(data)
                         if self.on_data(data):
@@ -564,14 +570,14 @@ class NtripWorker(QThread):
                         self._messages.update(scanner.feed(data))
                     self._emit_stats()
             except NtripFatalError as e:
-                self.status.emit(f"NTRIP: {e}")
+                self.status.emit('error', f"{e}")
                 self.state_changed.emit('error')
                 break
             except (NtripError, OSError) as e:
                 if self._stop:
                     break
                 self.state_changed.emit('reconnecting')
-                self.status.emit(f"NTRIP: {e}. Reconnecting in {self.RECONNECT_DELAY_S:g} s...")
+                self.status.emit('warn', f"{e}. Reconnecting in {self.RECONNECT_DELAY_S:g} s...")
                 self._sleep(self.RECONNECT_DELAY_S)
             finally:
                 self.client.close()
@@ -1049,6 +1055,8 @@ def list_serial_ports():
 class DashboardWindow(QMainWindow):
     UI_REFRESH_MS = 250
     FEED_MAX_LINES = 500
+    NTRIP_LOG_LINES = 50
+    NTRIP_LOG_COLORS = {'info': SLATE_400, 'ok': '#34d399', 'warn': '#fbbf24', 'error': '#f87171'}
 
     def __init__(self, args):
         super().__init__()
@@ -1315,6 +1323,20 @@ class DashboardWindow(QMainWindow):
         self.ntrip_info = QLabel()
         self.ntrip_info.setWordWrap(True)
         self.ntrip_info.setStyleSheet(f"font-family: '{mono_family()}'; font-size: 11px; color: {SLATE_200};")
+        log_header = QHBoxLayout()
+        log_header.addWidget(label("NTRIP LOG"))
+        log_header.addStretch()
+        clear_log = QToolButton()
+        clear_log.setText("Clear")
+        log_header.addWidget(clear_log)
+        self.ntrip_log = QPlainTextEdit()
+        self.ntrip_log.setReadOnly(True)
+        self.ntrip_log.setMaximumBlockCount(self.NTRIP_LOG_LINES)
+        self.ntrip_log.setFont(QFont(mono_family(), 8))
+        self.ntrip_log.setFixedHeight(110)
+        self.ntrip_log.setStyleSheet(f"color: {SLATE_200}; padding: 4px;")
+        self.ntrip_log.setPlaceholderText("Connection events and caster errors appear here.")
+        clear_log.clicked.connect(self.ntrip_log.clear)
 
         grid.addWidget(label("CASTER / PORT"), 0, 0, 1, 2)
         grid.addWidget(self.ntrip_host, 1, 0)
@@ -1331,6 +1353,8 @@ class DashboardWindow(QMainWindow):
         grid.addWidget(self.ntrip_button, 8, 0, 1, 2)
         grid.addWidget(self.ntrip_status, 9, 0, 1, 2)
         grid.addWidget(self.ntrip_info, 10, 0, 1, 2)
+        grid.addLayout(log_header, 11, 0, 1, 2)
+        grid.addWidget(self.ntrip_log, 12, 0, 1, 2)
         layout.addWidget(inset)
         return card
 
@@ -1519,7 +1543,7 @@ class DashboardWindow(QMainWindow):
             self.ntrip.stop()
             self.ntrip = None
             self._set_ntrip_state('stopped')
-            self._log_ntrip("NTRIP: stopped by user.")
+            self._log_ntrip('info', "stopped by user")
             return
 
         host, mount = self.ntrip_host.text().strip(), self.ntrip_mount.text().strip()
@@ -1528,13 +1552,15 @@ class DashboardWindow(QMainWindow):
         except ValueError:
             port = 0
         if not host or not mount or not 0 < port < 65536:
-            self._log_ntrip("NTRIP: enter caster, port and mountpoint first.")
+            self._log_ntrip('warn', "enter caster, port and mountpoint first")
             return
         self._save_ntrip_settings()
         self.ntrip_stats = {}
         self.ntrip = NtripWorker(host, port, mount, self.ntrip_user.text().strip(), self.ntrip_password.text(),
                                  self.ntrip_gga_check.isChecked(), self._forward_corrections, parent=self)
         self.ntrip.gga = self.parser.last_gga
+        self._rx_using_corrections = not math.isnan(self.parser.diff_age)
+        self._logged_fix_quality = self.parser.fix_quality
         self.ntrip.status.connect(self._log_ntrip)
         self.ntrip.state_changed.connect(self._on_ntrip_state)
         self.ntrip.stats.connect(self._on_ntrip_stats)
@@ -1579,9 +1605,29 @@ class DashboardWindow(QMainWindow):
         self.ntrip_stats = stats
         self._dirty = True
 
-    def _log_ntrip(self, message):
-        self.ntrip_status.setText(message)
-        self._feed_pending.append(f"<span style='color:#a78bfa'>» {html.escape(message)}</span>")
+    def _log_ntrip(self, level, message):
+        """Shows an NTRIP event in the status line, the NTRIP log (timestamped) and the raw feed."""
+        color = self.NTRIP_LOG_COLORS.get(level, SLATE_200)
+        self.ntrip_status.setText(f"<span style='color:{color}'>{html.escape(message)}</span>")
+        self.ntrip_log.appendHtml(f"<span style='color:{SLATE_500}'>{time.strftime('%H:%M:%S')}</span> "
+                                  f"<span style='color:{color}'>{html.escape(message)}</span>")
+        self._feed_pending.append(f"<span style='color:#a78bfa'>» NTRIP: {html.escape(message)}</span>")
+
+    def _track_correction_use(self):
+        """While corrections run, log when the receiver starts/stops using them and fix quality changes."""
+        p = self.parser
+        using = not math.isnan(p.diff_age)
+        if using != self._rx_using_corrections:
+            self._rx_using_corrections = using
+            if using:
+                station = f" (station {p.diff_station})" if p.diff_station else ""
+                self._log_ntrip('ok', f"receiver is using the corrections{station}")
+            else:
+                self._log_ntrip('warn', "receiver stopped using corrections")
+        if p.fix_quality != self._logged_fix_quality:
+            self._logged_fix_quality = p.fix_quality
+            label = FIX_QUALITY.get(p.fix_quality, (f"quality {p.fix_quality}", ""))[0]
+            self._log_ntrip('ok' if p.fix_quality in (4, 5) else 'info', f"receiver fix: {label}")
 
     def _log_status(self, message):
         self.conn_status.setText(message)
@@ -1601,6 +1647,7 @@ class DashboardWindow(QMainWindow):
             self._push_map_position()
             if self.ntrip:
                 self.ntrip.gga = self.parser.last_gga
+                self._track_correction_use()
 
     def _direction(self):
         """True heading if available, otherwise course over ground while moving."""
