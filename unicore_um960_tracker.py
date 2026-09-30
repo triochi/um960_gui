@@ -2,7 +2,8 @@
 """
 Unicore UM960 GNSS RTK NMEA Decoder and Real-time Tracker
 ---------------------------------------------------------
-Author: AI Assistant (AI Studio)
+https://github.com/triochi/um960_gui
+
 This script reads real-time NMEA stream from the Unicore UM960 module,
 decodes position, RTK fix quality, DOP, heading, and satellite details,
 converts the WGS84 geographic coordinates to Bulgarian BGS2005 UTM Zone 34N

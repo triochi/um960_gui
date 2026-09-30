@@ -1,6 +1,0 @@
-{
-  "name": "Unicore UM960 GNSS Dashboard",
-  "description": "Professional real-time GIS & tracking dashboard for the Unicore UM960 GNSS RTK module, featuring Web Serial connectivity, live coordinate conversions to BGS2005 (Bulgaria) & HGRS87 (Greece) grids, visual skyplots, and a Python script exporter.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
